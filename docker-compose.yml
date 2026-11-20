@@ -1,33 +1,84 @@
 services:
-  db:
+  db-primary:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: drill
       POSTGRES_PASSWORD: drill
       POSTGRES_DB: drill
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "hot_standby=on"
+      - "-c"
+      # remote_apply waits until the standby replayed the commit, so make the
+      # named standby a synchronous replica. Any number of standby names
+      # keeps the primary writable when the standby container is recreated.
+      - "synchronous_standby_names=ANY 1 (standby1)"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U drill -d drill"]
       interval: 2s
       timeout: 3s
       retries: 30
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgprimary:/var/lib/postgresql/data
+      - ./docker/postgres/init-primary.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+
+  db-standby:
+    image: postgres:16-alpine
+    depends_on:
+      db-primary:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: replpass
+    entrypoint: ["/standby/entrypoint-standby.sh"]
+    command:
+      - "postgres"
+      - "-c"
+      - "hot_standby=on"
+      - "-c"
+      # Recovery conflicts must not cancel replay while the drill pauses it.
+      - "max_standby_streaming_delay=-1"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U drill -d drill && pg_is_in_recovery"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - pgstandby:/var/lib/postgresql/data
+      - ./docker/postgres/entrypoint-standby.sh:/standby/entrypoint-standby.sh:ro
 
   web:
     build: .
     depends_on:
-      db:
+      db-primary:
+        condition: service_healthy
+      db-standby:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://drill:drill@db:5432/drill
+      DATABASE_URL: postgresql://drill:drill@db-primary:5432/drill
+      STANDBY_URL: postgresql://drill:drill@db-standby:5432/drill
+      REPLICATION_APP_NAME: standby1
+      REPLICATION_SLOT: standby1_slot
+      SYNC_STATE_FILE: /srv/var/sync_drills.json
       DRILL_SESSION_PREFIX: lockdrill
       BLOCK_CONFIRM_SECONDS: "8"
       RELEASE_WAIT_SECONDS: "10"
+      SYNC_WAIT_CONFIRM_SECONDS: "10"
       DRILL_TTL_SECONDS: "1800"
       LOG_LEVEL: INFO
     ports:
       - "8000:8000"
     stop_grace_period: 30s
+    volumes:
+      syncstate:/srv/var
 
 volumes:
-  pgdata:
+  pgprimary:
+  pgstandby:
+  syncstate:

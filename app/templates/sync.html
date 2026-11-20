@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>同步提交演练（remote_apply） · PostgreSQL 演练台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>同步提交演练 <span class="small">synchronous_commit = remote_apply</span></h1>
+  <p class="sub">暂停物理备库 WAL 回放 → 提交部署单 → 确认事务正在等待同步复制后取消等待 → 恢复回放核对两库实况。</p>
+  <nav class="nav">
+    <a href="/">行锁演练</a>
+    <a href="/sync" class="nav-active">同步提交演练</a>
+  </nav>
+</header>
+
+<main>
+{% if error %}<div class="banner banner-error" role="alert">{{ error }}</div>{% endif %}
+{% if message %}<div class="banner banner-ok" role="status">{{ message }}</div>{% endif %}
+{% if not standby_configured %}
+<div class="banner banner-warn" role="alert">未配置备库连接（STANDBY_URL）：本页所有操作不可用，两库核对中的备库项将标记为「无法确认」。</div>
+{% endif %}
+{% if persistence_error %}
+<div class="banner banner-warn" role="alert">{{ persistence_error }}（重启后的历史结果可能不完整）</div>
+{% endif %}
+
+<section class="panel actions">
+  <form method="post" action="/sync/start" class="inline">
+    <button type="submit" class="btn btn-primary">开始新一轮同步提交演练</button>
+  </form>
+  <span class="hint">新一轮会自动恢复上一轮暂停的备库回放。</span>
+</section>
+
+{% if snap %}
+{% set s = snap %}
+<section class="panel" id="sync-panel"
+         data-sync-id="{{ s.id }}"
+         data-token="{{ token or '' }}"
+         data-status="{{ s.status }}">
+  <div class="panel-head">
+    <h2>第 {{ s.round }} 轮 <span class="mono small">#{{ s.id[:8] }}</span></h2>
+    <span class="status status-{{ s.status }}" id="status-badge">{{ s.status }}</span>
+  </div>
+  <p class="meta">
+    创建时间 <span class="mono">{{ s.created_at }}</span>
+    {% if s.ended_reason %} · {{ s.ended_reason }}{% endif %}
+  </p>
+  {% if s.error %}<div class="banner banner-error">{{ s.error }}</div>{% endif %}
+
+  <!-- 备库 WAL 回放控制 -->
+  <article class="card card-standby">
+    <h3>物理备库与 WAL 回放</h3>
+    <dl class="kv">
+      <dt>备库连接</dt>
+      <dd>{% if s.standby_configured %}<span class="tag tag-ok">已配置</span>{% else %}<span class="tag tag-bad">未配置 · 无法确认</span>{% endif %}</dd>
+      <dt>回放状态</dt>
+      <dd id="replay-state">
+        {% if not s.standby_configured %}<span class="tag tag-bad">无法确认</span>
+        {% elif s.standby_paused %}<span class="tag tag-warn">已暂停</span>
+        {% else %}<span class="tag tag-ok">回放中</span>{% endif %}
+      </dd>
+    </dl>
+    <div class="controls">
+      <form method="post" action="/sync/{{ s.id }}/pause" class="inline" id="form-pause">
+        <input type="hidden" name="token" value="{{ token }}">
+        <button type="submit" class="btn btn-danger" {% if not s.can_pause %}disabled{% endif %}>暂停备库 WAL 回放</button>
+      </form>
+      <form method="post" action="/sync/{{ s.id }}/resume" class="inline" id="form-resume">
+        <input type="hidden" name="token" value="{{ token }}">
+        <button type="submit" class="btn" {% if not s.can_resume %}disabled{% endif %}>恢复回放</button>
+      </form>
+      <span class="hint">暂停生效后才允许提交部署单。</span>
+    </div>
+  </article>
+
+  <!-- 部署单提交 -->
+  <article class="card card-submit">
+    <h3>提交部署单（remote_apply 事务）</h3>
+    <form method="post" action="/sync/{{ s.id }}/submit" id="form-submit" class="order-form">
+      <input type="hidden" name="token" value="{{ token }}">
+      <label>部署单号
+        <input type="text" name="order_no" required maxlength="64"
+               pattern="[A-Za-z0-9_\-]{1,64}" placeholder="例如 DEPLOY-20261120-001"
+               class="input mono" {% if not s.can_submit %}disabled{% endif %}>
+      </label>
+      <label>备注
+        <input type="text" name="note" maxlength="200" placeholder="可选"
+               class="input" {% if not s.can_submit %}disabled{% endif %}>
+      </label>
+      <button type="submit" class="btn btn-primary" {% if not s.can_submit %}disabled{% endif %}>
+        用 remote_apply 提交一条记录
+      </button>
+    </form>
+    {% if not s.can_submit %}<p class="hint">请先暂停备库 WAL 回放并确认生效；已结束的轮次不能再提交。</p>{% endif %}
+  </article>
+
+  <!-- 等待确认 / 取消 -->
+  <article class="card card-wait" id="wait-card">
+    <h3>同步复制等待与取消</h3>
+    {% if s.commit_pid is not none %}
+    <dl class="kv">
+      <dt>提交会话 PID</dt><dd class="mono">{{ s.commit_pid }}</dd>
+      <dt>会话启动时间</dt><dd class="mono">{{ s.commit_backend_start or '—' }}</dd>
+      <dt>应用名</dt><dd class="mono small">lockdrill:sync:commit:{{ s.id[:8] }}…</dd>
+      <dt>会话状态</dt>
+      <dd id="commit-state">
+        {% if s.commit_session %}{{ s.commit_session.state }}
+        {% else %}已结束{% endif %}
+      </dd>
+      <dt>等待事件</dt>
+      <dd id="commit-wait">
+        {% if s.commit_session and s.commit_session.wait_event_type %}
+          <span class="tag tag-warn">{{ s.commit_session.wait_event_type }} / {{ s.commit_session.wait_event }}</span>
+        {% elif s.commit_session %}不在等待{% else %}—{% endif %}
+      </dd>
+      <dt>同步等待确认</dt>
+      <dd id="waiting-confirmed">
+        {% if s.waiting_confirmed %}
+        <span class="tag tag-ok">已确认正在等待同步复制（IPC/SyncRep）</span>
+        {% else %}<span class="tag tag-bad">尚未确认 · 无法取消</span>{% endif %}
+      </dd>
+    </dl>
+    {% else %}
+    <p class="hint">尚未提交部署单。</p>
+    {% endif %}
+    <div class="controls">
+      <form method="post" action="/sync/{{ s.id }}/cancel" class="inline" id="form-cancel"
+            onsubmit="return confirm('仅终止本演练的提交会话（PID {{ s.commit_pid }}）。终止前会再次核对其正在等待同步复制。继续？');">
+        <input type="hidden" name="token" value="{{ token }}">
+        <button type="submit" class="btn btn-danger" id="btn-cancel"
+                {% if not s.can_cancel %}disabled{% endif %}>
+          取消等待（终止等待中的提交会话）
+        </button>
+      </form>
+      <span class="hint" id="cancel-hint">
+        {% if s.can_cancel %}数据库已确认该事务正在等待同步复制，可取消。
+        {% else %}只有页面确认该事务正在等待同步复制时，才可取消等待。{% endif %}
+      </span>
+    </div>
+  </article>
+
+  {% if s.result %}
+  {% set r = s.result %}
+  <section class="verdict {{ 'verdict-ok' if r.outcome == 'synced' else ('verdict-warn' if r.outcome == 'cancelled' else 'verdict-bad') }}" id="verdict">
+    <h3>本次提交结果：{{ r.label }}</h3>
+    <p class="verdict-text">{{ r.detail }}</p>
+    <dl class="kv">
+      <dt>结果类型</dt><dd class="mono">{{ r.outcome }}</dd>
+      <dt>终止会话</dt><dd class="mono">{{ r.terminated }}</dd>
+      {% if r.terminate_error %}<dt>终止错误</dt><dd class="mono">{{ r.terminate_error }}</dd>{% endif %}
+      <dt>提交会话结果</dt>
+      <dd class="mono">
+        {% if r.commit_outcome %}{{ r.commit_outcome.status }}（{{ r.commit_outcome.elapsed_seconds }}s）
+        {% if r.commit_outcome.error %}：{{ r.commit_outcome.error }}{% endif %}
+        {% else %}无结果{% endif %}
+      </dd>
+      <dt>完成时间</dt><dd class="mono">{{ r.finished_at }}</dd>
+    </dl>
+  </section>
+  {% endif %}
+
+  <!-- 两库实况核对 -->
+  {% if s.verification %}
+  {% set v = s.verification %}
+  <section class="card card-verify" id="verify-card">
+    <h3>按单号 <span class="mono">{{ v.order_no }}</span> 核对两库实况
+      <span class="small">（核对时间 <span class="mono">{{ v.checked_at }}</span>）</span>
+    </h3>
+    <table class="tbl">
+      <thead><tr><th>核对项</th><th>主库</th><th>物理备库</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>连接与查询</td>
+          <td>{% if v.primary.confirmed %}<span class="tag tag-ok">已确认</span>
+            {% else %}<span class="tag tag-bad">无法确认{% if v.primary.error %}：{{ v.primary.error }}{% endif %}</span>{% endif %}</td>
+          <td>{% if v.standby.confirmed %}<span class="tag tag-ok">已确认</span>
+            {% else %}<span class="tag tag-bad">无法确认{% if v.standby.error %}：{{ v.standby.error }}{% endif %}</span>{% endif %}</td>
+        </tr>
+        <tr>
+          <td>单号记录</td>
+          <td id="primary-found">
+            {% if v.primary.error %}<span class="tag tag-bad">无法确认</span>
+            {% elif v.primary.found %}<span class="tag tag-ok">可查到</span>
+            {% else %}<span class="tag tag-bad">查不到</span>{% endif %}
+          </td>
+          <td id="standby-found">
+            {% if v.standby.error %}<span class="tag tag-bad">无法确认</span>
+            {% elif v.standby.found %}<span class="tag tag-ok">可查到</span>
+            {% else %}<span class="tag tag-bad">查不到</span>{% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td>行详情</td>
+          <td class="mono small">{% if v.primary.row %}{{ v.primary.row.created_at }}{% if v.primary.row.committed_at %} · commit {{ v.primary.row.committed_at }}{% endif %}{% else %}—{% endif %}</td>
+          <td class="mono small">{% if v.standby.row %}{{ v.standby.row.created_at }}{% if v.standby.row.committed_at %} · commit {{ v.standby.row.committed_at }}{% endif %}{% else %}—{% endif %}</td>
+        </tr>
+        <tr>
+          <td>备库回放</td>
+          <td>—</td>
+          <td>{% if v.replay_paused is none %}<span class="tag tag-bad">无法确认</span>
+            {% elif v.replay_paused %}<span class="tag tag-warn">暂停中</span>
+            {% else %}<span class="tag tag-ok">回放中</span>{% endif %}</td>
+        </tr>
+        <tr>
+          <td>复制状态（主库视角）</td>
+          <td colspan="2" class="mono small">
+            {% if v.replication %}
+              {{ v.replication.application_name }} · sync_state={{ v.replication.sync_state }} · state={{ v.replication.state }}
+              · replay_lag={{ v.replication.replay_lag_bytes }} bytes
+            {% elif v.primary.confirmed %}<span class="tag tag-bad">未观察到备库复制连接 · 无法确认</span>
+            {% else %}<span class="tag tag-bad">无法确认</span>{% endif %}
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    {% if s.caught_up %}
+    <p class="hint">已追平：两库均可查到同一单号（{{ s.caught_up_at }}）。历史提交结果仍保持「{{ s.result.label if s.result else '—' }}」。</p>
+    {% endif %}
+    <div class="controls">
+      <form method="post" action="/sync/{{ s.id }}/verify" class="inline">
+        <input type="hidden" name="token" value="{{ token }}">
+        <button type="submit" class="btn">立即重新核对两库</button>
+      </form>
+      <form method="post" action="/sync/{{ s.id }}/resume" class="inline">
+        <input type="hidden" name="token" value="{{ token }}">
+        <button type="submit" class="btn" {% if not s.can_resume %}disabled{% endif %}>恢复回放并追平</button>
+      </form>
+    </div>
+  </section>
+  {% endif %}
+</section>
+{% else %}
+<section class="panel empty">
+  <p>当前没有同步提交演练。开始一轮后：暂停备库 WAL 回放 → 等暂停生效 → 填部署单号用 remote_apply 提交 →
+     页面确认同步复制等待 → 取消等待 → 恢复回放核对两库。</p>
+</section>
+{% endif %}
+
+{% if recent %}
+<section class="panel">
+  <h2>最近同步提交演练</h2>
+  <table class="tbl">
+    <thead><tr><th>轮次</th><th>创建</th><th>部署单号</th><th>状态</th><th>提交结果</th><th>两库核对</th><th></th></tr></thead>
+    <tbody>
+    {% for r in recent %}
+      <tr>
+        <td>#{{ r.round }} <span class="mono small">{{ r.id[:8] }}</span></td>
+        <td class="mono">{{ r.created_at }}</td>
+        <td class="mono">{{ r.order_no or '—' }}</td>
+        <td><span class="status status-{{ r.status }}">{{ r.status }}</span></td>
+        <td>{% if r.result %}<span class="tag {{ 'tag-ok' if r.result.outcome == 'synced' else ('tag-warn' if r.result.outcome == 'cancelled' else 'tag-bad') }}">{{ r.result.label }}</span>{% else %}—{% endif %}</td>
+        <td>
+          {% if r.verification %}
+            主 {% if r.verification.primary.error %}<span class="tag tag-bad">无法确认</span>
+              {% elif r.verification.primary.found %}<span class="tag tag-ok">有</span>{% else %}<span class="tag tag-bad">无</span>{% endif %}
+            备 {% if r.verification.standby.error %}<span class="tag tag-bad">无法确认</span>
+              {% elif r.verification.standby.found %}<span class="tag tag-ok">有</span>{% else %}<span class="tag tag-bad">无</span>{% endif %}
+          {% else %}—{% endif %}
+        </td>
+        <td><a href="/sync/{{ r.id }}">查看</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+</main>
+
+<script src="/static/sync.js"></script>
+</body>
+</html>

@@ -11,6 +11,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# Persisted synchronous-commit drill verdicts (survive web restarts).
+RUN mkdir -p /srv/var
+
 EXPOSE 8000
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \

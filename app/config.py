@@ -1,4 +1,4 @@
-"""Configuration for the row-lock drill app."""
+"""Configuration for the drill app."""
 
 from __future__ import annotations
 
@@ -29,6 +29,9 @@ def _int_env(name: str, default: int) -> int:
 @dataclass(frozen=True)
 class Settings:
     database_url: str
+    # Optional physical standby used by the synchronous-commit drill. Empty
+    # disables the feature (the page renders in an unavailable state).
+    standby_url: str
     session_prefix: str
     connect_timeout: int
     # How long to wait for the observed blocking edge to appear.
@@ -39,6 +42,13 @@ class Settings:
     refused_wait_seconds: float
     # Abandoned active drills are cleaned up after this many seconds.
     drill_ttl_seconds: float
+    # Synchronous-commit drill timings.
+    sync_wait_confirm_seconds: float
+    sync_catchup_seconds: float
+    sync_drill_ttl_seconds: float
+    # Replication slot / standby identity used on the primary.
+    replication_slot: str
+    replication_app_name: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -46,12 +56,20 @@ class Settings:
             database_url=os.environ.get(
                 "DATABASE_URL", "postgresql://drill:drill@localhost:5432/drill"
             ),
+            standby_url=os.environ.get("STANDBY_URL", ""),
             session_prefix=os.environ.get("DRILL_SESSION_PREFIX", "lockdrill"),
             connect_timeout=_int_env("DB_CONNECT_TIMEOUT", 5),
             block_confirm_seconds=_float_env("BLOCK_CONFIRM_SECONDS", 5.0),
             release_wait_seconds=_float_env("RELEASE_WAIT_SECONDS", 10.0),
             refused_wait_seconds=_float_env("REFUSED_WAIT_SECONDS", 2.0),
             drill_ttl_seconds=_float_env("DRILL_TTL_SECONDS", 1800.0),
+            sync_wait_confirm_seconds=_float_env("SYNC_WAIT_CONFIRM_SECONDS", 10.0),
+            sync_catchup_seconds=_float_env("SYNC_CATCHUP_SECONDS", 30.0),
+            sync_drill_ttl_seconds=_float_env("SYNC_DRILL_TTL_SECONDS", 7200.0),
+            replication_slot=os.environ.get("REPLICATION_SLOT", "standby1_slot"),
+            replication_app_name=os.environ.get(
+                "REPLICATION_APP_NAME", "standby1"
+            ),
         )
 
 

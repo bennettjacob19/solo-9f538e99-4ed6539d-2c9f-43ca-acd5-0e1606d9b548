@@ -136,3 +136,43 @@ main { padding: 20px 28px 60px; max-width: 1180px; margin: 0 auto; }
 
 .hint { color: var(--muted); font-size: 12px; }
 .empty p { color: var(--muted); margin: 0; }
+
+.nav { margin: 10px 0 0; display: flex; gap: 14px; font-size: 13px; }
+.nav a {
+  color: var(--muted);
+  text-decoration: none;
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+.nav a:hover { color: var(--text); border-color: var(--accent); }
+.nav a.nav-active { color: var(--accent); border-color: var(--accent); }
+
+.status-ready { color: var(--muted); }
+.status-pausing, .status-paused { border-color: var(--warn); color: var(--warn); }
+.status-submitting, .status-cancelling { border-color: var(--accent); color: var(--accent); }
+.status-waiting { border-color: var(--warn); color: var(--warn); }
+.status-synced { border-color: var(--ok); color: var(--ok); }
+.status-cancelled, .status-expired { border-color: var(--accent); color: var(--accent); }
+
+.card-standby { border-left: 3px solid var(--warn); margin-bottom: 16px; }
+.card-submit { border-left: 3px solid var(--accent); margin-bottom: 16px; }
+.card-wait { border-left: 3px solid var(--bad); margin-bottom: 16px; }
+.card-verify { border-left: 3px solid var(--ok); }
+
+.verdict-warn { background: #33270f; border: 1px solid #7a5b1c; }
+
+.order-form { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+.order-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 8px 10px;
+  font-size: 13px;
+  min-width: 240px;
+}
+.input:focus { outline: none; border-color: var(--accent); }
+.input:disabled { opacity: .5; }
+
